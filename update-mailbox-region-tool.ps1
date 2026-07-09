@@ -296,11 +296,33 @@ Process {
         'Status'
     )
     Write-Host $header -ForegroundColor White
-    Write-Host ('-' * $header.Length) -ForegroundColor DarkGray
+    $separator = '-' * $header.Length
+    Write-Host $separator -ForegroundColor DarkGray
 
-    $total = $targetList.Count
-    $index = 0
+    $total            = $targetList.Count
+    $index            = 0
+    $progressDivisor  = [math]::Max($total, 1)
+    $runTimestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $progressActivity = if ($Execute) { 'Updating mailbox regional settings' } else { 'Reading mailbox regional settings' }
+
+    # Pre-build the Set-MailboxRegionalConfiguration params once; only Identity changes per mailbox
+    if ($Execute) {
+        $setParams = @{
+            Identity    = $null
+            Language    = $effectiveLanguage
+            TimeZone    = $effectiveTimeZone
+            DateFormat  = $effectiveDateFormat
+            TimeFormat  = $effectiveTimeFormat
+            ErrorAction = 'Stop'
+        }
+        if ($LocalizeDefaultFolderName) { $setParams['LocalizeDefaultFolderName'] = $true }
+    }
+
+    # Counters incremented during the loop to avoid post-loop Where-Object passes
+    $successCount     = 0
+    $skippedCount     = 0
+    $failCount        = 0
+    $needsUpdateCount = 0
 
     foreach ($mailbox in $targetList) {
         $index++
@@ -312,7 +334,7 @@ Process {
         Write-Progress -Activity $progressActivity `
                        -Status   ("[$index / $total] $dispName") `
                        -CurrentOperation $mbxId `
-                       -PercentComplete  ([math]::Round($index / [math]::Max($total, 1) * 100))
+                       -PercentComplete  ([math]::Round($index / $progressDivisor * 100))
 
         # Read current regional configuration
         try {
@@ -347,30 +369,26 @@ Process {
         if ($Execute) {
             if ($needsUpdate -or $ForceUpdate) {
                 try {
-                    $setParams = @{
-                        Identity    = $mbxId
-                        Language    = $effectiveLanguage
-                        TimeZone    = $effectiveTimeZone
-                        DateFormat  = $effectiveDateFormat
-                        TimeFormat  = $effectiveTimeFormat
-                        ErrorAction = 'Stop'
-                    }
-                    if ($LocalizeDefaultFolderName) { $setParams['LocalizeDefaultFolderName'] = $true }
+                    $setParams['Identity'] = $mbxId
                     Set-MailboxRegionalConfiguration @setParams
                     $status       = 'Success'
                     $updateStatus = 'Updated'
+                    $successCount++
                 } catch {
                     $status       = 'Failed'
                     $message      = $_.Exception.Message
                     $updateStatus = 'UpdateFailed'
+                    $failCount++
                 }
             } else {
                 $status       = 'Skipped'
                 $updateStatus = 'AlreadyUpToDate'
+                $skippedCount++
             }
         } else {
             $status       = if ($needsUpdate) { 'WouldApply' } else { 'UpToDate' }
             $updateStatus = if ($needsUpdate) { 'Yes' } else { 'No' }
+            if ($needsUpdate) { $needsUpdateCount++ }
         }
 
         $rowColor = switch ($status) {
@@ -398,7 +416,7 @@ Process {
         Write-Host $row -ForegroundColor $rowColor
 
         $logEntries.Add([PSCustomObject]@{
-            Timestamp          = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Timestamp          = $runTimestamp
             PrimarySmtpAddress = $mbxId
             Alias              = $alias
             DisplayName        = $dispName
@@ -419,15 +437,11 @@ Process {
 
     Write-Progress -Activity $progressActivity -Completed
 
-    Write-Host ('-' * $header.Length) -ForegroundColor DarkGray
+    Write-Host $separator -ForegroundColor DarkGray
 
     if ($Execute) {
-        $successCount = @($logEntries | Where-Object { $_.Status -eq 'Success' }).Count
-        $skippedCount = @($logEntries | Where-Object { $_.Status -eq 'Skipped' }).Count
-        $failCount    = @($logEntries | Where-Object { $_.Status -eq 'Failed'  }).Count
         Write-Host ("Completed: {0} updated, {1} skipped (already correct), {2} failed.`n" -f $successCount, $skippedCount, $failCount)
     } else {
-        $needsUpdateCount = @($logEntries | Where-Object { $_.NeedsUpdate -eq 'Yes' }).Count
         Write-Host ("Report complete: {0} of {1} mailbox(es) need updating.`n" -f $needsUpdateCount, $logEntries.Count)
     }
 }
@@ -435,9 +449,9 @@ Process {
 End {
     # Write CSV log (always)
     if ($logEntries.Count -gt 0) {
-        # ConvertTo-Csv + Set-Content writes UTF-8 WITH BOM on both PS5.1 and PS7,
+        # Export-Csv with UTF8 encoding writes UTF-8 WITH BOM on both PS5.1 and PS7,
         # ensuring correct display of non-ASCII characters (e.g. accented names) when opened in Excel.
-        $logEntries | ConvertTo-Csv -NoTypeInformation | Set-Content -LiteralPath $logFile -Encoding UTF8
+        $logEntries | Export-Csv -LiteralPath $logFile -Encoding UTF8 -NoTypeInformation
         Write-Host ("Log saved to: {0}" -f $logFile) -ForegroundColor Cyan
     }
 
